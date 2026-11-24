@@ -24,11 +24,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg llvm clang lld libssl-dev zip unzip python3 gcc
-          LLD=$(command -v ld64.lld || true)
-          if [ -z "$LLD" ]; then
-            LLD=$(find /usr -type f -executable -path '*/bin/ld64.lld*' 2>/dev/null | sort -V | tail -1)
-          fi
-          test -n "$LLD" || { echo "ld64.lld introuvable"; dpkg -L lld | grep bin/; exit 1; }
+          LLD=$(command -v lld)
+          test -n "$LLD" || { echo "lld introuvable"; exit 1; }
           echo "LLD=$LLD" >> "$GITHUB_ENV"
           echo "resolved: $LLD"
 
@@ -140,7 +137,7 @@ jobs:
           clang $TGT -c fishhook/fishhook.c -o fishhook.o
           clang $TGT -fmodules -I fishhook -c dylib/speed.m -o speed.o
 
-          "$LLD" -dylib -arch arm64 -platform_version ios 14.0 14.0 \
+          "$LLD" -flavor darwin -dylib -arch arm64 -platform_version ios 14.0 14.0 \
             -syslibroot "$SDK" -install_name @rpath/speed.dylib \
             -framework Foundation -framework QuartzCore -lobjc -lSystem \
             fishhook.o speed.o -o speed.dylib
