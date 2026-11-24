@@ -20,12 +20,10 @@ jobs:
       RATE: ${{ inputs.rate }}
       DELAY: ${{ inputs.delay_s }}
     steps:
-      - uses: actions/checkout@v4
-
       - name: install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg llvm clang lld libssl-dev zip unzip python3
+          sudo apt-get install -y ffmpeg llvm clang lld libssl-dev zip unzip python3 gcc
 
       - name: get iphoneos sdk
         run: |
@@ -62,8 +60,6 @@ jobs:
           } | tee ../analysis.txt
 
       - name: slow audio (atempo, pitch conservé)
-        env:
-          RATE: ${{ inputs.rate }}
         run: |
           cd work
           APP=$(ls -d Payload/*.app | grep -i subway | head -1)
@@ -83,13 +79,59 @@ jobs:
 
       - name: build dylib hook (linux, cible iOS)
         run: |
+          mkdir -p dylib
+          cat > dylib/speed.m <<'EOF'
+          #import <Foundation/Foundation.h>
+          #import <QuartzCore/QuartzCore.h>
+          #include <mach/mach_time.h>
+          #include <dispatch/dispatch.h>
+          #include "fishhook.h"
+
+          static double gRate = __RATE__;
+          static double gDelay = __DELAY__;
+
+          static volatile BOOL gActive = NO;
+          static CFTimeInterval gR0cf = 0;
+          static uint64_t gR0mach = 0;
+
+          static CFTimeInterval (*orig_CACurrentMediaTime)(void);
+          static uint64_t (*orig_mach_absolute_time)(void);
+
+          static CFTimeInterval hook_CACurrentMediaTime(void) {
+              CFTimeInterval r = orig_CACurrentMediaTime();
+              if (!gActive) return r;
+              return gR0cf + (r - gR0cf) * gRate;
+          }
+
+          static uint64_t hook_mach_absolute_time(void) {
+              uint64_t r = orig_mach_absolute_time();
+              if (!gActive) return r;
+              return gR0mach + (uint64_t)((double)(r - gR0mach) * gRate);
+          }
+
+          __attribute__((constructor))
+          static void speed_init(void) {
+              rebind_symbols((struct rebinding[]){
+                  {"CACurrentMediaTime", hook_CACurrentMediaTime, (void **)&orig_CACurrentMediaTime},
+                  {"mach_absolute_time", hook_mach_absolute_time, (void **)&orig_mach_absolute_time},
+              }, 2);
+
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gDelay * NSEC_PER_SEC)),
+                             dispatch_get_main_queue(), ^{
+                  gR0cf = orig_CACurrentMediaTime();
+                  gR0mach = orig_mach_absolute_time();
+                  gActive = YES;
+              });
+          }
+          EOF
+          sed -i "s/__RATE__/$RATE/; s/__DELAY__/$DELAY/" dylib/speed.m
+
           git clone --depth 1 https://github.com/facebook/fishhook fishhook
           git clone --depth 1 https://github.com/Tyilo/insert_dylib insert_dylib
-          sed -i "s/gRate = 0.5;/gRate = $RATE;/; s/gDelay = 13.0;/gDelay = $DELAY;/" dylib/speed.m
 
           TGT="-target arm64-apple-ios14.0 -isysroot $SDK -fobjc-arc -O2"
           clang $TGT -c fishhook/fishhook.c -o fishhook.o
-          clang $TGT -fmodules -c dylib/speed.m -o speed.o
+          clang $TGT -fmodules -I fishhook -c dylib/speed.m -o speed.o
 
           ld64.lld -dylib -arch arm64 -platform_version ios 14.0 14.0 \
             -syslibroot "$SDK" -install_name @rpath/speed.dylib \
@@ -104,9 +146,9 @@ jobs:
           cd work
           APP=$(ls -d Payload/*.app | grep -i subway | head -1)
           [ -n "$APP" ] || APP=$(ls -d Payload/*.app | head -1)
-          BIN="$APP/$(python3 -c "import plistlib,sys; print(plistlib.load(open(sys.argv[1],'rb'))['CFBundleExecutable'])" "$APP/Info.plist")"
           mkdir -p "$APP/Frameworks"
           cp ../speed.dylib "$APP/Frameworks/speed.dylib"
+          BIN="$APP/$(python3 -c "import plistlib,sys; print(plistlib.load(open(sys.argv[1],'rb'))['CFBundleExecutable'])" "$APP/Info.plist")"
           ../insert_dylib_bin --inplace --all-yes "@rpath/speed.dylib" "$BIN"
           cd ..
 
