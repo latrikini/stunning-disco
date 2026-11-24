@@ -81,7 +81,7 @@ jobs:
           done
           find "$APP" -name '*.caf' | sed 's/^/caf non traité: /' || true
 
-      - name: build dylib hook (linux, cible iOS)
+      - name: build speed.dylib (clang target iOS)
         run: |
           mkdir -p dylib
           cat > dylib/speed.m <<'EOF'
@@ -131,7 +131,6 @@ jobs:
           sed -i "s/__RATE__/$RATE/; s/__DELAY__/$DELAY/" dylib/speed.m
 
           git clone --depth 1 https://github.com/facebook/fishhook fishhook
-          git clone --depth 1 https://github.com/Tyilo/insert_dylib insert_dylib
 
           TGT="-target arm64-apple-ios14.0 -isysroot $SDK -fobjc-arc -O2"
           clang $TGT -c fishhook/fishhook.c -o fishhook.o
@@ -142,8 +141,105 @@ jobs:
             -framework Foundation -framework QuartzCore -lobjc -lSystem \
             fishhook.o speed.o -o speed.dylib
 
-          MAIN=$(find insert_dylib -name main.c | head -1)
-          gcc -O2 -I"$SDK/usr/include" -o insert_dylib_bin "$MAIN"
+      - name: build mach-o patcher (natif, sans sdk apple)
+        run: |
+          cat > patch_dylib.c <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+
+          #define MH_MAGIC_64 0xfeedfacfu
+          #define FAT_MAGIC   0xcafebabeu
+          #define FAT_CIGAM   0xbebafecau
+          #define LC_SEGMENT_64 0x19u
+          #define LC_LOAD_DYLIB 0x0cu
+
+          typedef struct { uint32_t magic; int32_t cputype; int32_t cpusubtype;
+              uint32_t filetype; uint32_t ncmds; uint32_t sizeofcmds; uint32_t flags; uint32_t reserved; } mh64_t;
+          typedef struct { uint32_t cmd; uint32_t cmdsize; } lc_t;
+          typedef struct { uint32_t name_off; uint32_t timestamp; uint32_t cur_ver; uint32_t compat_ver; } dylib_t;
+          typedef struct { uint32_t cmd; uint32_t cmdsize; dylib_t dylib; } dylib_cmd_t;
+          typedef struct { uint32_t cmd; uint32_t cmdsize; char segname[16];
+              uint64_t vmaddr; uint64_t vmsize; uint64_t fileoff; uint64_t filesize;
+              int32_t maxprot; int32_t initprot; uint32_t nsects; uint32_t flags; } seg64_t;
+          typedef struct { char sectname[16]; char segname[16]; uint64_t addr; uint64_t size;
+              uint32_t offset; uint32_t align; uint32_t reloff; uint32_t nreloc;
+              uint32_t flags; uint32_t r1; uint32_t r2; uint32_t r3; } sect64_t;
+
+          int main(int argc, char **argv) {
+              if (argc != 3) { fprintf(stderr, "usage: %s <dylib_install_path> <macho_binary>\n", argv[0]); return 1; }
+              const char *dylib_path = argv[1];
+              const char *bin_path = argv[2];
+
+              FILE *f = fopen(bin_path, "r+b");
+              if (!f) { perror("fopen"); return 1; }
+              fseek(f, 0, SEEK_END);
+              long fsize = ftell(f);
+              fseek(f, 0, SEEK_SET);
+              unsigned char *buf = malloc(fsize);
+              if (fread(buf, 1, fsize, f) != (size_t)fsize) { fprintf(stderr, "short read\n"); return 1; }
+
+              uint32_t magic; memcpy(&magic, buf, 4);
+              if (magic == FAT_MAGIC || magic == FAT_CIGAM) {
+                  fprintf(stderr, "binaire fat (multi-arch), pas supporté ici — ipa app store attendu thin arm64\n");
+                  return 1;
+              }
+              if (magic != MH_MAGIC_64) { fprintf(stderr, "pas un mach-o 64 bits (magic=%08x)\n", magic); return 1; }
+
+              mh64_t *hdr = (mh64_t *)buf;
+              size_t lc_start = sizeof(mh64_t);
+              size_t lc_end = lc_start + hdr->sizeofcmds;
+
+              uint32_t min_sect_off = 0xFFFFFFFFu;
+              size_t cur = lc_start;
+              for (uint32_t i = 0; i < hdr->ncmds; i++) {
+                  lc_t *lc = (lc_t *)(buf + cur);
+                  if (lc->cmd == LC_SEGMENT_64) {
+                      seg64_t *seg = (seg64_t *)(buf + cur);
+                      unsigned char *secp = buf + cur + sizeof(seg64_t);
+                      for (uint32_t s = 0; s < seg->nsects; s++) {
+                          sect64_t *sec = (sect64_t *)secp;
+                          if (sec->offset > 0 && sec->offset < min_sect_off) min_sect_off = sec->offset;
+                          secp += sizeof(sect64_t);
+                      }
+                  }
+                  cur += lc->cmdsize;
+              }
+              if (min_sect_off == 0xFFFFFFFFu) { fprintf(stderr, "pad de header introuvable\n"); return 1; }
+
+              size_t name_len = strlen(dylib_path) + 1;
+              size_t cmdsize = sizeof(dylib_cmd_t) + name_len;
+              cmdsize = (cmdsize + 7) & ~7UL;
+              size_t avail = min_sect_off - lc_end;
+
+              if (avail < cmdsize) {
+                  fprintf(stderr, "pas assez de pad: besoin %zu, dispo %zu\n", cmdsize, avail);
+                  return 1;
+              }
+
+              unsigned char *newcmd = calloc(1, cmdsize);
+              dylib_cmd_t *dc = (dylib_cmd_t *)newcmd;
+              dc->cmd = LC_LOAD_DYLIB;
+              dc->cmdsize = (uint32_t)cmdsize;
+              dc->dylib.name_off = sizeof(dylib_cmd_t);
+              dc->dylib.timestamp = 2;
+              dc->dylib.cur_ver = 0x10000;
+              dc->dylib.compat_ver = 0x10000;
+              memcpy(newcmd + sizeof(dylib_cmd_t), dylib_path, name_len);
+
+              memcpy(buf + lc_end, newcmd, cmdsize);
+              hdr->ncmds += 1;
+              hdr->sizeofcmds += (uint32_t)cmdsize;
+
+              fseek(f, 0, SEEK_SET);
+              fwrite(buf, 1, fsize, f);
+              fclose(f);
+              printf("LC_LOAD_DYLIB inséré: %s (cmdsize=%zu, pad dispo=%zu)\n", dylib_path, cmdsize, avail);
+              return 0;
+          }
+          EOF
+          gcc -O2 -o patch_dylib_bin patch_dylib.c
 
       - name: inject
         run: |
@@ -153,7 +249,7 @@ jobs:
           mkdir -p "$APP/Frameworks"
           cp ../speed.dylib "$APP/Frameworks/speed.dylib"
           BIN="$APP/$(python3 -c "import plistlib,sys; print(plistlib.load(open(sys.argv[1],'rb'))['CFBundleExecutable'])" "$APP/Info.plist")"
-          ../insert_dylib_bin --inplace --all-yes "@rpath/speed.dylib" "$BIN"
+          ../patch_dylib_bin "@rpath/speed.dylib" "$BIN"
           cd ..
 
       - name: repack
