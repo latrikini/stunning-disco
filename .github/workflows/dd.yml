@@ -26,7 +26,7 @@ jobs:
           sudo apt-get install -y ffmpeg llvm clang lld libssl-dev zip unzip python3 gcc
           LLD=$(command -v ld64.lld || true)
           if [ -z "$LLD" ]; then
-            LLD=$(find /usr -iname 'ld64.lld*' -type f 2>/dev/null | sort -V | tail -1)
+            LLD=$(find /usr -type f -executable -path '*/bin/ld64.lld*' 2>/dev/null | sort -V | tail -1)
           fi
           test -n "$LLD" || { echo "ld64.lld introuvable"; dpkg -L lld | grep bin/; exit 1; }
           echo "LLD=$LLD" >> "$GITHUB_ENV"
