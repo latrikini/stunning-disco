@@ -1,0 +1,147 @@
+name: dd
+
+on:
+  workflow_dispatch:
+    inputs:
+      rate:
+        description: "vitesse audio et jeu (0.5 = moitié)"
+        default: "0.5"
+      delay_s:
+        description: "délai avant ralentissement du jeu (s)"
+        default: "13"
+
+env:
+  MEDIAFIRE_PAGE: "https://www.mediafire.com/file/jx838utr87l604s/CairoV2_by_SG.ipa/file"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      RATE: ${{ inputs.rate }}
+      DELAY: ${{ inputs.delay_s }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg llvm clang lld libssl-dev zip unzip python3
+
+      - name: get iphoneos sdk
+        run: |
+          git clone --depth 1 https://github.com/theos/sdks sdks
+          SDK=$(find sdks -maxdepth 1 -type d -name 'iPhoneOS*.sdk' | sort -V | tail -1)
+          test -n "$SDK" || { echo "sdk introuvable"; exit 1; }
+          echo "SDK=$PWD/$SDK" >> "$GITHUB_ENV"
+
+      - name: resolve + download ipa
+        run: |
+          DIRECT=$(curl -sL "$MEDIAFIRE_PAGE" | grep -oE 'https://download[^"]+' | head -1)
+          test -n "$DIRECT" || { echo "lien direct introuvable"; exit 1; }
+          curl -L --fail -o in.ipa "$DIRECT"
+          sha256sum in.ipa | tee ipa.sha256
+          mkdir work && cd work && unzip -q ../in.ipa
+
+      - name: analyse (bundle subwaysurfers)
+        run: |
+          cd work
+          APP=$(ls -d Payload/*.app | grep -i subway | head -1)
+          [ -n "$APP" ] || APP=$(ls -d Payload/*.app | head -1)
+          BIN="$APP/$(python3 -c "import plistlib,sys; print(plistlib.load(open(sys.argv[1],'rb'))['CFBundleExecutable'])" "$APP/Info.plist")"
+          {
+            echo "== app =="
+            echo "APP=$APP"
+            python3 -c "import plistlib,sys; p=plistlib.load(open(sys.argv[1],'rb')); [print(k, '=', p.get(k)) for k in ('CFBundleIdentifier','CFBundleShortVersionString','MinimumOSVersion')]" "$APP/Info.plist"
+            echo "== binaire =="
+            file "$BIN" || true
+            llvm-objdump --macho --private-headers "$BIN" | grep -A2 'LC_LOAD_DYLIB\|LC_RPATH' | head -60 || true
+            echo "== audio =="
+            find "$APP" \( -name '*.mp3' -o -name '*.m4a' -o -name '*.wav' -o -name '*.caf' \) -exec ls -la {} \;
+            echo "== frameworks =="
+            ls "$APP/Frameworks" 2>/dev/null || echo "aucun"
+          } | tee ../analysis.txt
+
+      - name: slow audio (atempo, pitch conservé)
+        env:
+          RATE: ${{ inputs.rate }}
+        run: |
+          cd work
+          APP=$(ls -d Payload/*.app | grep -i subway | head -1)
+          [ -n "$APP" ] || APP=$(ls -d Payload/*.app | head -1)
+          find "$APP" \( -name '*.mp3' -o -name '*.m4a' -o -name '*.wav' \) -print0 | while IFS= read -r -d '' f; do
+            ext="${f##*.}"; tmp="${f}.slow.${ext}"
+            case "$ext" in
+              mp3) codec="libmp3lame" ;;
+              m4a) codec="aac" ;;
+              wav) codec="pcm_s16le" ;;
+            esac
+            ffmpeg -y -loglevel error -i "$f" -filter:a "atempo=$RATE" -vn -c:a "$codec" "$tmp"
+            mv "$tmp" "$f"
+            echo "slowed: $f"
+          done
+          find "$APP" -name '*.caf' | sed 's/^/caf non traité: /' || true
+
+      - name: build dylib hook (linux, cible iOS)
+        run: |
+          git clone --depth 1 https://github.com/facebook/fishhook fishhook
+          git clone --depth 1 https://github.com/Tyilo/insert_dylib insert_dylib
+          sed -i "s/gRate = 0.5;/gRate = $RATE;/; s/gDelay = 13.0;/gDelay = $DELAY;/" dylib/speed.m
+
+          TGT="-target arm64-apple-ios14.0 -isysroot $SDK -fobjc-arc -O2"
+          clang $TGT -c fishhook/fishhook.c -o fishhook.o
+          clang $TGT -fmodules -c dylib/speed.m -o speed.o
+
+          ld64.lld -dylib -arch arm64 -platform_version ios 14.0 14.0 \
+            -syslibroot "$SDK" -install_name @rpath/speed.dylib \
+            -framework Foundation -framework QuartzCore -lobjc -lSystem \
+            fishhook.o speed.o -o speed.dylib
+
+          MAIN=$(find insert_dylib -name main.c | head -1)
+          gcc -O2 -I"$SDK/usr/include" -o insert_dylib_bin "$MAIN"
+
+      - name: inject
+        run: |
+          cd work
+          APP=$(ls -d Payload/*.app | grep -i subway | head -1)
+          [ -n "$APP" ] || APP=$(ls -d Payload/*.app | head -1)
+          BIN="$APP/$(python3 -c "import plistlib,sys; print(plistlib.load(open(sys.argv[1],'rb'))['CFBundleExecutable'])" "$APP/Info.plist")"
+          mkdir -p "$APP/Frameworks"
+          cp ../speed.dylib "$APP/Frameworks/speed.dylib"
+          ../insert_dylib_bin --inplace --all-yes "@rpath/speed.dylib" "$BIN"
+          cd ..
+
+      - name: repack
+        run: |
+          cd work && zip -qr ../patched.ipa Payload && cd ..
+          sha256sum patched.ipa > patched.sha256
+
+      - name: sign (optionnel, skip si pas de cert)
+        env:
+          P12_B64: ${{ secrets.IOS_CERT_P12_B64 }}
+          P12_PASS: ${{ secrets.IOS_CERT_PASSWORD }}
+          PROFILE_B64: ${{ secrets.IOS_PROFILE_B64 }}
+        run: |
+          if [ -z "$P12_B64" ]; then
+            echo "pas de cert, signature skippée"
+            exit 0
+          fi
+          git clone --depth 1 https://github.com/zhlynn/zsign zsign && make -C zsign
+          echo "$P12_B64" | base64 -d > cert.p12
+          echo "$PROFILE_B64" | base64 -d > profile.mobileprovision
+          ./zsign/zsign -k cert.p12 -p "$P12_PASS" -m profile.mobileprovision -o signed.ipa patched.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: analysis
+          path: |
+            analysis.txt
+            ipa.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: patched-ipa
+          if-no-files-found: ignore
+          path: |
+            patched.ipa
+            patched.sha256
+            signed.ipa
